@@ -1,0 +1,7 @@
+{
+    "code-runner.executorMap": {
+        "cpp": "cd $dir && C:\\msys64\\ucrt64\\bin\\g++.exe -std=c++17 -Wall -Wextra -pthread $fileName -o $fileNameWithoutExt && .\\$fileNameWithoutExt"
+    },
+    "code-runner.runInTerminal": true,
+    "code-runner.saveFileBeforeRun": true
+}
