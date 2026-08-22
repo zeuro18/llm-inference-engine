@@ -22,8 +22,6 @@ double now_ms() {
     return us/1000.0;
 }
 
-// Result must come FIRST — Request contains promise<Result>,
-// so the compiler needs to know what Result is before seeing Request.
 struct Result {
     int    id;
     int    prompt_length;
@@ -124,7 +122,7 @@ struct AdmissionPolicy {
     virtual ~AdmissionPolicy()=default;
 };
 
-struct FCFSPolicy : AdmissionPolicy {
+struct FCFSPolicy: AdmissionPolicy {
     std::vector<int> pick(const std::vector<Request>& waiting,int free_slots) override {
         std::vector<int> idx;
         for (int i=0;i<(int)waiting.size()&&(int)idx.size()<free_slots;i++)
@@ -170,7 +168,7 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config, Admi
 
         std::sort(picks.begin(), picks.end(), [](int a, int b) { return a > b; }); // back->front
         std::vector<Slot> batch;
-        for (int idx : picks) {
+        for (int idx: picks) {
             Slot s;
             s.request = std::move(waiting[idx]);
             batch.push_back(std::move(s));
@@ -199,16 +197,16 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config, Admi
             t += step_ms;                               // one decode tick and every seat pays
             ++ticks;
             for (auto& s : batch) {
-                if (s.finished) continue;               // plate on the counter: the waste
+                if (s.finished) continue;              
                 ++s.tokens_generated;
                 if (s.tokens_generated >= s.true_out_len) {
                     s.finished    = true;
                     s.finish_tick = ticks;
                     s.end_ms      = t;
                     ++finished;
-                    s.request.promise.set_value(Result{   // customer leaves the moment
-                        s.request.id, s.request.prompt_length,      // their food is done 
-                        s.true_out_len, s.request.arrival_ms,       // but seat stays reserved
+                    s.request.promise.set_value(Result{   
+                        s.request.id, s.request.prompt_length,     
+                        s.true_out_len, s.request.arrival_ms,       
                         s.start_ms, s.first_token_ms, s.end_ms});
                 }
             }
@@ -216,7 +214,7 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config, Admi
 
         long idle = 0;
         for (auto& s : batch) idle += ticks - s.finish_tick;
-        total_idle       += idle;
+        total_idle+= idle;
         total_seat_ticks += (long)seats * ticks;
         ++total_batches;
 
