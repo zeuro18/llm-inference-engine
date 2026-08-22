@@ -346,37 +346,20 @@ struct CliOptions {
     bool verbose = false;
 };
 
-bool parse_bool(const std::string& v) {
-    return v == "1" || v == "true" || v == "yes" || v == "on";
-}
-
 CliOptions parse_args(int argc, char** argv) {
     CliOptions opt;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--verbose") { opt.verbose = true; continue; }
-
-        auto eq = arg.find('=');
-        if (arg.rfind("--", 0) != 0 || eq == std::string::npos) {
-            std::cerr << "warning: ignoring unrecognized argument '" << arg << "'\n";
-            continue;
-        }
-        std::string key = arg.substr(2, eq - 2);
-        std::string val = arg.substr(eq + 1);
-        try {
-            if      (key == "mode")   opt.mode   = val;
-            else if (key == "policy") opt.policy = val;
-            else if (key == "lambda") opt.lambda = std::stod(val);
-            else if (key == "seed")   opt.seed   = (unsigned)std::stoul(val);
-            else if (key == "out")    opt.out    = val;
-            else if (key == "n")      opt.n      = std::stoi(val);
-            else if (key == "pace")   opt.pace   = parse_bool(val);
-            else std::cerr << "warning: unknown option '--" << key << "'\n";
-        } catch (const std::exception&) {
-            std::cerr << "error: bad value for --" << key << ": '" << val << "'\n";
-            std::exit(1);
-        }
+    if (argc == 8) {
+        opt.mode   = argv[1];
+        opt.policy = argv[2];
+        opt.lambda = std::stod(argv[3]);
+        opt.seed   = std::stoi(argv[4]);
+        opt.out    = argv[5];
+        opt.n      = std::stoi(argv[6]);
+        opt.pace   = (std::string(argv[7]) == "1");
+    } else if (argc > 1) {
+        std::cerr << "warning: expected 7 arguments, using defaults\n";
     }
+    
     return opt;
 }
 

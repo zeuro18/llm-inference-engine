@@ -23,9 +23,9 @@ This code simulates both methods so you can measure the difference.
 g++ -std=c++17 main.cpp -o main
 ```
 
-2. Run the simulation. You can choose the mode (continuous or static) and the arrival rate of requests (lambda):
+2. Run the simulation. The arguments are: `mode policy lambda seed output_file num_requests pace`
 ```bash
-./main --mode=continuous --lambda=5 --out=results.csv
+./main continuous fcfs 5.0 42 results.csv 200 1
 ```
 
 3. Generate the graphs using Python (requires pandas and matplotlib):
