@@ -17,7 +17,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
-# ── style ──────────────────────────────────────────────────────────────────
+
 plt.rcParams.update({
     "figure.facecolor": "#0f1117",
     "axes.facecolor":   "#1a1d27",
