@@ -1,0 +1,15 @@
+# Compiled executables
+*.exe
+
+# VSCode config
+.vscode/
+
+# CSV data files
+*.csv
+data/*.csv
+
+# Test files and scratchpads
+testfiles/
+
+# Local scripts
+scripts/sweep.ps1
