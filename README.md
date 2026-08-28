@@ -95,6 +95,8 @@ Ran with `N=500` requests under a deliberately tight memory budget (100 total KV
 | TTFT (p95) | 85.3s | **43.5s** | ~49% lower |
 | Preemptions | 82 | **40** | ~51% less thrashing |
 
+![Impact of Prefix Caching](data/caching_impact.png)
+
 **2. Which eviction policy wins under pressure?**
 
 | Metric | LRU | Cost-Ratio | GDS |
@@ -102,6 +104,8 @@ Ran with `N=500` requests under a deliberately tight memory budget (100 total KV
 | Cache hit rate | 82.78% | 82.22% | **83.33%** |
 | Duration | 146.7s | 149.9s | **146.9s** |
 | TTFT (p95) | **43.5s** | 46.9s | **43.5s** |
+
+![Eviction Policy Performance](data/eviction_policies.png)
 
 Cost-Ratio ends up hoarding expensive prefixes for too long and loses on both hit rate and speed as a result. GDS balances cost against size and recency and comes out ahead. Same idea as the real GreedyDual-Size algorithm, just applied to KV blocks instead of HTTP objects.
 
