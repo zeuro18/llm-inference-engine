@@ -16,6 +16,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 std::chrono::steady_clock::time_point program_start;
@@ -35,6 +36,7 @@ struct Result {
   double start_ms;
   double first_token_ms;
   double end_ms;
+  int shared_len;
 };
 
 struct Request {
@@ -45,6 +47,8 @@ struct Request {
   double arrival_ms;
   std::promise<Result> promise;
   double ttft_deadline_ms = 0.0;
+  int template_id;
+  int shared_len;
 };
 
 //EngineConfig is basically parameters for a mock GPU. here we just
@@ -65,9 +69,13 @@ struct EngineConfig {
   int kv_block_size=16;
   int total_kv_blocks=256;
   double ttft_slo_ms=500.0;
+  int num_templates = 5;
+  bool prefix_cache = false;
+  std::string eviction = "lru";
+  bool quadratic_cost = false;
 };
 
-// aggregate stats by a worker for 1 run
+//aggregate stats by a worker for 1 run
 struct RunStats {
   long total_batches = 0;
   long idle_seat_ticks = 0;
@@ -94,6 +102,8 @@ struct Slot {
   bool prefill_done=false;
   int kv_blocks_used=0;
   bool preempted=false;
+  int cached_prefix_blocks = 0;
+  bool needs_cache_insert = false;
 };
 
 struct kvBlockAllocator{
@@ -107,6 +117,38 @@ struct kvBlockAllocator{
     return can_give;
   }
   void release(int n) { used -= n; if(used<0) used=0; }
+};
+
+struct PrefixCacheEntry {
+    int template_id;
+    int blocks_used;       
+    int ref_count = 0;      
+    int last_used_tick = 0; 
+    int shared_len = 0;     
+    double gds_priority = 0.0; 
+};
+
+struct PrefixCache {
+    std::unordered_map<int, PrefixCacheEntry> entries;
+    long hits = 0;
+    long misses = 0;
+
+    PrefixCacheEntry* lookup(int template_id) {
+        auto it = entries.find(template_id);
+        if (it != entries.end()) return &it->second;
+        return nullptr;
+    }
+
+    const PrefixCacheEntry* lookup(int template_id) const {
+        auto it = entries.find(template_id);
+        if (it != entries.end()) return &it->second;
+        return nullptr;
+    }
+
+    double hit_rate() const {
+        long total = hits + misses;
+        return total > 0 ? (double)hits / total : 0.0;
+    }
 };
 
 template<typename T>
@@ -160,15 +202,36 @@ int slot_cost(const Slot& s, int chunk_size) {
     int remaining_prompt = s.request.prompt_length - s.prompt_tokens_processed;
     return std::min(chunk_size, remaining_prompt);
   }
-  return 1; // 1 decode token
+  return 1; //1 decode token
+}
+
+// effective first chunk cost of admitting each waiting request, in
+// batch token budget units. If request template already has a cached
+// prefix, only its non shared/unique tokens need to be prefilled
+
+std::vector<int> compute_first_chunk_costs(const std::vector<Request>& waiting,
+                                            int chunk_size,
+                                            const PrefixCache* prefix_cache) {
+  std::vector<int> costs(waiting.size());
+  for (size_t i = 0; i < waiting.size(); i++) {
+    int effective_prompt_length = waiting[i].prompt_length;
+    if (prefix_cache && waiting[i].template_id >= 0) {
+      const PrefixCacheEntry* cached = prefix_cache->lookup(waiting[i].template_id);
+      if (cached && cached->blocks_used > 0) {
+        effective_prompt_length = std::max(0, waiting[i].prompt_length - waiting[i].shared_len);
+      }
+    }
+    costs[i] = std::min(effective_prompt_length, chunk_size);
+  }
+  return costs;
 }
 
 struct AdmissionPolicy {
   virtual std::vector<int> pick(
       const std::vector<Request>& waiting,
+      const std::vector<int>& first_chunk_costs,
       int free_slots,
       int budget_remaining,
-      int chunk_size,
       double current_time) = 0;
   virtual ~AdmissionPolicy() = default;
 };
@@ -176,17 +239,17 @@ struct AdmissionPolicy {
 struct FCFSPolicy : AdmissionPolicy {
   std::vector<int> pick(
       const std::vector<Request>& waiting,
+      const std::vector<int>& first_chunk_costs,
       int free_slots,
       int budget_remaining,
-      int chunk_size,
       double /*current_time*/) override {
     std::vector<int> idx;
     int budget = budget_remaining;
     for (int i = 0; i < (int)waiting.size() && (int)idx.size() < free_slots; i++) {
-      int first_chunk_cost = std::min(waiting[i].prompt_length, chunk_size);
-      if (first_chunk_cost <= budget) {
+      int cost = first_chunk_costs[i];
+      if (cost <= budget) {
         idx.push_back(i);
-        budget -= first_chunk_cost;
+        budget -= cost;
       }
     }
     return idx;
@@ -196,22 +259,23 @@ struct FCFSPolicy : AdmissionPolicy {
 struct ShortPromptFirstPolicy : AdmissionPolicy {
   std::vector<int> pick(
       const std::vector<Request>& waiting,
+      const std::vector<int>& first_chunk_costs,
       int free_slots,
       int budget_remaining,
-      int chunk_size,
       double /*current_time*/) override {
     std::vector<int> order;
     for (int i = 0; i < (int)waiting.size(); i++) order.push_back(i);
+    //sorting by effective post cache cost instead of just raw prompt length
     std::sort(order.begin(), order.end(), [&](int a, int b) {
-      return waiting[a].prompt_length < waiting[b].prompt_length;
+      return first_chunk_costs[a] < first_chunk_costs[b];
     });
     std::vector<int> idx;
     int budget = budget_remaining;
     for (int i : order) {
-      int first_chunk_cost = std::min(waiting[i].prompt_length, chunk_size);
-      if (first_chunk_cost > budget) break;
+      int cost = first_chunk_costs[i];
+      if (cost > budget) break;
       idx.push_back(i);
-      budget -= first_chunk_cost;
+      budget -= cost;
       if ((int)idx.size() >= free_slots) break;
     }
     std::sort(idx.begin(), idx.end());
@@ -222,9 +286,9 @@ struct ShortPromptFirstPolicy : AdmissionPolicy {
 struct SLOPolicy : AdmissionPolicy{
   std::vector<int> pick(
       const std::vector<Request>& waiting,
+      const std::vector<int>& first_chunk_costs,
       int free_slots,
       int budget_remaining,
-      int chunk_size,
       double current_time) override {
    
     std::vector<int> order;
@@ -232,14 +296,14 @@ struct SLOPolicy : AdmissionPolicy{
     std::sort(order.begin(), order.end(), [&](int a, int b) {
       double slack_a = waiting[a].ttft_deadline_ms - current_time;
       double slack_b = waiting[b].ttft_deadline_ms - current_time;
-      return slack_a < slack_b;  //smaller slack = more urgent = goes first
+      return slack_a < slack_b;  //smaller slack= more urgent = goes first
     });
  
     std::vector<int> idx;
     int budget = budget_remaining;
     for (int i : order) {
       if ((int)idx.size() >= free_slots) break;
-      int cost = std::min(waiting[i].prompt_length, chunk_size);
+      int cost = first_chunk_costs[i];
       if (cost <= budget) {
         idx.push_back(i);
         budget -= cost;
@@ -250,6 +314,20 @@ struct SLOPolicy : AdmissionPolicy{
   }
 
 };
+
+struct PromptTemplate {
+    int id;
+    int shared_len;  
+};
+
+PromptTemplate templates[] = {
+    {0, 30},  
+    {1, 80},   
+    {2, 200},  
+    {3, 400},
+    {4, 50},   
+};
+
 
 void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
                     AdmissionPolicy& policy, RunStats& stats) {
@@ -262,7 +340,7 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
 
   while (!(done && waiting.empty())) {
     if (waiting.empty()) {
-      Request first = q.pop(); // nap until someone arrives
+      Request first = q.pop(); //nap until someone arrives
       if (first.id == -1) done = true;
       else waiting.push_back(std::move(first));
     }
@@ -274,7 +352,8 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
       waiting.push_back(std::move(*m));
     }
 
-    std::vector<int> picks = policy.pick(waiting, config.max_slots, config.max_batch_tokens, config.prefill_chunk_size, sim_clock);
+    std::vector<int> first_chunk_costs = compute_first_chunk_costs(waiting, config.prefill_chunk_size, nullptr);
+    std::vector<int> picks = policy.pick(waiting, first_chunk_costs, config.max_slots, config.max_batch_tokens, sim_clock);
     std::sort(picks.begin(), picks.end(), [](int a, int b) { return a > b; }); // back->front
 
     std::vector<Slot> batch;
@@ -329,7 +408,7 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
     total_idle += idle;
     total_seat_ticks += (long)seats * ticks;
     ++total_batches;
-    sim_clock = t; // carry the simulated clock forward into the next batch
+    sim_clock = t; //carry the simulated clock forward into the next batch
 
     if (config.pace_with_sleeps)
       std::this_thread::sleep_for(
@@ -349,6 +428,48 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
             << "% wasted)\n";
 }
 
+double compute_cost(int shared_len, const EngineConfig& cfg) {
+    double cost = cfg.p0 + cfg.p1 * shared_len;
+    if (cfg.quadratic_cost) {
+        cost += 0.001 * shared_len * shared_len;
+    }
+    return cost;
+}
+
+void evict_for_blocks(int needed, kvBlockAllocator& allocator, PrefixCache& prefix_cache, const EngineConfig& cfg, int current_tick, double& gds_L) {
+    while (allocator.free_blocks() < needed) {
+        auto best_it = prefix_cache.entries.end();
+        double best_score = -1e9;
+        
+        for (auto it = prefix_cache.entries.begin(); it != prefix_cache.entries.end(); ++it) {
+            if (it->second.ref_count > 0) continue;
+            
+            double score = 0;
+            if (cfg.eviction == "lru") {
+                score = current_tick - it->second.last_used_tick; 
+            } else if (cfg.eviction == "cost_ratio") {
+                score = (double)(current_tick - it->second.last_used_tick) / compute_cost(it->second.shared_len, cfg);
+            } else if (cfg.eviction == "gds") {
+                score = -it->second.gds_priority;
+            }
+            
+            if (score > best_score) {
+                best_score = score;
+                best_it = it;
+            }
+        }
+        
+        if (best_it == prefix_cache.entries.end()) break; 
+        
+        if (cfg.eviction == "gds") {
+            gds_L = best_it->second.gds_priority;
+        }
+        
+        allocator.release(best_it->second.blocks_used);
+        prefix_cache.entries.erase(best_it);
+    }
+}
+
 void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
                         AdmissionPolicy& policy, RunStats& stats) {
   std::mt19937 rng(cfg.seed);
@@ -361,6 +482,8 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
   double t = 0.0;
   double run_start = -1;
   kvBlockAllocator allocator(cfg.total_kv_blocks);
+  PrefixCache prefix_cache;
+  double gds_L = 0.0;
 
   if (cfg.prefill_chunk_size > cfg.max_batch_tokens) {
     std::cerr << "Error: prefill_chunk_size must be less than or equal to max_batch_tokens\n";
@@ -384,10 +507,16 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
     for (int i = (int)active.size() - 1; i >= 0; --i) {
       if (active[i].finished) {
         allocator.release(active[i].kv_blocks_used);
+        if (cfg.prefix_cache && active[i].cached_prefix_blocks > 0) {
+            auto* cached = prefix_cache.lookup(active[i].request.template_id);
+            if (cached) cached->ref_count--;
+        }
         active.erase(active.begin() + i);
       } else if (active[i].preempted) {
         allocator.release(active[i].kv_blocks_used);
         active[i].kv_blocks_used = 0;
+        active[i].cached_prefix_blocks = 0;
+        active[i].needs_cache_insert = false;
         active[i].prefill_done = false;
         active[i].prompt_tokens_processed = 0;
         active[i].tokens_generated = 0;
@@ -407,7 +536,9 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
     
     // admit new requests
     if (free_slots > 0 && budget_remaining > 0 && !waiting.empty()) {
-      std::vector<int> picks = policy.pick(waiting, free_slots, budget_remaining, cfg.prefill_chunk_size, t);
+      std::vector<int> first_chunk_costs = compute_first_chunk_costs(
+          waiting, cfg.prefill_chunk_size, cfg.prefix_cache ? &prefix_cache : nullptr);
+      std::vector<int> picks = policy.pick(waiting, first_chunk_costs, free_slots, budget_remaining, t);
       if (was_idle && !picks.empty()) {
         double max_arrival = 0.0;
         for (int idx : picks) {
@@ -415,15 +546,40 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
         }
         t = std::max(t, max_arrival);
       }
+      
       std::vector<int> admitted_picks;
-      int available_blocks=allocator.free_blocks();
+      std::unordered_map<int, int> reserved_blocks;
+      // idx-> cache entry this pick is relying on. Recorded rather than rederived after
+      // admission, so we increment ref_count exactly once per admitted
+      // hit and can protect the entry from eviction by a later pick in same batch
+      std::unordered_map<int, PrefixCacheEntry*> pending_hits;
       for (int idx: picks) {
-        int prompt_blocks = (waiting[idx].prompt_length+cfg.kv_block_size-1)/cfg.kv_block_size;
-        if (available_blocks >= prompt_blocks) {
+        int required_blocks = (waiting[idx].prompt_length+cfg.kv_block_size-1)/cfg.kv_block_size;
+        auto* cached = (cfg.prefix_cache && waiting[idx].template_id >= 0) ? prefix_cache.lookup(waiting[idx].template_id) : nullptr;
+        bool tentative_hit = false;
+        if (cached && cached->blocks_used > 0) {
+            int unique_len = waiting[idx].prompt_length - waiting[idx].shared_len;
+            required_blocks = (unique_len + cfg.kv_block_size - 1) / cfg.kv_block_size;
+            // Reserve this entry immediately so it cant be evicted by a
+            // later picks budget check within this same admission pass
+            cached->ref_count++;
+            tentative_hit = true;
+        }
+
+        if (allocator.free_blocks() < required_blocks && cfg.prefix_cache) {
+            evict_for_blocks(required_blocks, allocator, prefix_cache, cfg, total_ticks, gds_L);
+        }
+
+        if (allocator.free_blocks() >= required_blocks) {
           admitted_picks.push_back(idx);
-          available_blocks-=prompt_blocks;
+          allocator.allocate(required_blocks);
+          reserved_blocks[idx] = required_blocks;
+          if (tentative_hit) pending_hits[idx] = cached;
+        } else if (tentative_hit) {
+          cached->ref_count--;
         }
       }
+      
       std::sort(admitted_picks.begin(), admitted_picks.end(), [](int a, int b) { return a > b; });
       for (int idx: admitted_picks) {
         Slot s;
@@ -433,14 +589,28 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
         s.prompt_tokens_processed = 0;
         s.prefill_done = false;
         s.tokens_generated = 0;
-        //allocate initial kv blocks
-        int prompt_blocks=(s.request.prompt_length+cfg.kv_block_size-1)/cfg.kv_block_size;
-        s.kv_blocks_used= allocator.allocate(prompt_blocks);
+        s.kv_blocks_used = reserved_blocks[idx];
+        s.cached_prefix_blocks = 0;
+        s.needs_cache_insert = false;
+        
+        auto hit_it = pending_hits.find(idx);
+        if (hit_it != pending_hits.end()) {
+            PrefixCacheEntry* cached = hit_it->second;
+            prefix_cache.hits++;
+            // ref_count was already bumped when we reserved this pick above.
+            cached->last_used_tick = total_ticks;
+            s.prompt_tokens_processed = cached->shared_len;
+            s.cached_prefix_blocks = cached->blocks_used;
+        } else {
+            prefix_cache.misses++;
+            if (cfg.prefix_cache && s.request.template_id >= 0) {
+                s.needs_cache_insert = true;
+            }
+        }
 
         if(run_start<0) run_start=t;
         active.push_back(std::move(s));
         waiting.erase(waiting.begin()+idx);
-
       }
     }
 
@@ -452,7 +622,7 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
       tokens_tick += slot_cost(s, cfg.prefill_chunk_size);
     }
 
-    // step time: total tokens processed
+    // step time= total tokens processed
     double step_ms = cfg.d0 + cfg.d1 * tokens_tick;
     t += step_ms;
     total_ticks++;
@@ -468,7 +638,37 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
         if (s.prompt_tokens_processed >= s.request.prompt_length) {
           s.prefill_done = true;
           s.first_token_ms = t;
-          s.tokens_generated = 1; // first free token
+          s.tokens_generated = 1; //first free token
+          
+          if (cfg.prefix_cache && s.needs_cache_insert && s.request.template_id >= 0) {
+              int shared_blocks = (s.request.shared_len + cfg.kv_block_size - 1) / cfg.kv_block_size;
+              // another slot on the same template may have finished itsprefill and inserted a
+              // cache entry while we were still prefilling-> so join instead of overwriting.
+              auto* existing = prefix_cache.lookup(s.request.template_id);
+              if (existing) {
+                  existing->ref_count++;
+                  existing->last_used_tick = total_ticks;
+                  int give_back = std::min(shared_blocks, s.kv_blocks_used);
+                  allocator.release(give_back);
+                  s.kv_blocks_used -= give_back;
+                  s.cached_prefix_blocks = existing->blocks_used;
+              } else {
+                  PrefixCacheEntry entry;
+                  entry.template_id = s.request.template_id;
+                  entry.blocks_used = shared_blocks;
+                  entry.ref_count = 1;
+                  entry.shared_len = s.request.shared_len;
+                  entry.last_used_tick = total_ticks;
+                  entry.gds_priority = shared_blocks > 0
+                      ? compute_cost(entry.shared_len, cfg) / entry.blocks_used + gds_L
+                      : gds_L;
+                  prefix_cache.entries[entry.template_id] = entry;
+
+                  s.cached_prefix_blocks = shared_blocks;
+                  s.kv_blocks_used -= shared_blocks; // slot transfers ownership to cache
+              }
+              s.needs_cache_insert = false;
+          }
         }
       } else {
 
@@ -476,32 +676,62 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
         s.tokens_generated++;
         tokens_made++;
         int total_tokens=s.request.prompt_length+ s.tokens_generated;
-        int blocks_needed=(total_tokens+cfg.kv_block_size-1)/cfg.kv_block_size;
-        if(blocks_needed>s.kv_blocks_used){
-          int extra_blocks=blocks_needed-s.kv_blocks_used;
-          int got=allocator.allocate(extra_blocks);
-          s.kv_blocks_used+=got;
+        int blocks_needed = (total_tokens + cfg.kv_block_size - 1) / cfg.kv_block_size;
+        int blocks_held = s.kv_blocks_used + s.cached_prefix_blocks;
+        
+        if (blocks_needed > blocks_held) {
+          int extra_blocks = blocks_needed - blocks_held;
+          
+          if (cfg.prefix_cache && allocator.free_blocks() < extra_blocks) {
+              evict_for_blocks(extra_blocks, allocator, prefix_cache, cfg, total_ticks, gds_L);
+          }
+          
+          int got = allocator.allocate(extra_blocks);
+          s.kv_blocks_used += got;
           int still_need = extra_blocks - got;
           if (still_need > 0) {
-            // KV Preemption
-            for (auto& victim : active) {
-              if (!victim.finished && !victim.preempted && victim.request.tier > s.request.tier) {
-                victim.preempted = true;
-                stats.total_preemptions++;
-                allocator.release(victim.kv_blocks_used);
-                victim.kv_blocks_used = 0;
-                int grab = std::min(still_need, allocator.free_blocks());
-                allocator.allocate(grab);
-                s.kv_blocks_used += grab;
-                still_need -= grab;
-                if (still_need == 0) break;
+            //KV Preemption= repeatedly preempt the lowest priority eligible active slot
+            // until we have freed enough blocks or run out of eligible victims
+            while (still_need > 0) {
+              auto victim_it = active.end();
+              for (auto it = active.begin(); it != active.end(); ++it) {
+                if (it->finished || it->preempted || it->request.tier <= s.request.tier) continue;
+                if (victim_it == active.end() || it->request.tier > victim_it->request.tier) {
+                  victim_it = it;
+                }
               }
+              if (victim_it == active.end()) break; // no eligible victim left
+
+              victim_it->preempted = true;
+              stats.total_preemptions++;
+              allocator.release(victim_it->kv_blocks_used);
+              victim_it->kv_blocks_used = 0;
+
+              if (cfg.prefix_cache && victim_it->cached_prefix_blocks > 0) {
+                  auto* cached = prefix_cache.lookup(victim_it->request.template_id);
+                  if (cached) cached->ref_count--;
+                  victim_it->cached_prefix_blocks = 0;
+              }
+
+              if (cfg.prefix_cache && allocator.free_blocks() < still_need) {
+                  evict_for_blocks(still_need, allocator, prefix_cache, cfg, total_ticks, gds_L);
+              }
+
+              int grab = std::min(still_need, allocator.free_blocks());
+              allocator.allocate(grab);
+              s.kv_blocks_used += grab;
+              still_need -= grab;
             }
             if (still_need > 0) {
               s.preempted = true;
               stats.total_preemptions++;
               allocator.release(s.kv_blocks_used);
               s.kv_blocks_used = 0;
+              if (cfg.prefix_cache && s.cached_prefix_blocks > 0) {
+                  auto* cached = prefix_cache.lookup(s.request.template_id);
+                  if (cached) cached->ref_count--;
+                  s.cached_prefix_blocks = 0;
+              }
               s.tokens_generated--; 
               tokens_made--;
               continue;
@@ -513,7 +743,7 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
           s.end_ms = t;
           s.request.promise.set_value(Result{
               s.request.id, s.request.tier, s.request.prompt_length, s.true_out_len,
-              s.request.arrival_ms, s.start_ms, s.first_token_ms, s.end_ms});
+              s.request.arrival_ms, s.start_ms, s.first_token_ms, s.end_ms, s.request.shared_len});
         }
       }
     }
@@ -544,6 +774,12 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
             << " avg_occupancy=" << avg_occupancy << "/" << cfg.max_slots
             << " idle_seat_ticks=" << idle_ticks
             << " preemptions=" << stats.total_preemptions << "\n";
+            
+  if (cfg.prefix_cache) {
+      std::cerr << "[prefix_cache] hits=" << prefix_cache.hits 
+                << " misses=" << prefix_cache.misses 
+                << " hit_rate=" << (prefix_cache.hit_rate() * 100.0) << "%\n";
+  }
 }
 
 
@@ -555,26 +791,40 @@ double get_tier_slo(int tier) {
 
 struct TraceEntry {
   double arrival_ms; 
-  int prompt_length;
-  int tier;          // 0=Enterprise,1 = Pro, 2 = Free
+  int prompt_length; 
+  int tier; // 0=Enterprise,1 = Pro, 2 = Free
+  int template_id;
+  int shared_len; 
 };
 
-std::vector<TraceEntry> generate_trace(unsigned seed, int n, double lambda) {
+std::vector<TraceEntry> generate_trace(unsigned seed, int n, double lambda, int num_templates) {
   std::mt19937 rng(seed);
   std::exponential_distribution<> gap_s(lambda);
-  std::uniform_int_distribution<> prompt_len(10, 500);
-  std::discrete_distribution<> tier_dist({0.2, 0.3, 0.5}); // 20% Enterprise, 30% Pro, 50% Free
+  std::uniform_int_distribution<> unique_len_dist(10, 150);
+  std::discrete_distribution<> tier_dist({0.2, 0.3, 0.5}); //20% Enterprise, 30% Pro, 50% Free
   std::vector<TraceEntry> trace;
   trace.reserve(n);
   double t = 0.0;
+  std::uniform_int_distribution<> template_dist(0, std::max(0, num_templates - 1));
+
   for (int i = 0; i < n; ++i) {
     t += gap_s(rng) * 1000.0;
-    trace.push_back({ t, prompt_len(rng), tier_dist(rng) });
+    int template_id = -1;
+    int shared_len = 0;
+    int unique_len = unique_len_dist(rng);
+    if (num_templates > 0) {
+      template_id = template_dist(rng);
+      shared_len = templates[template_id % 5].shared_len; //5 templates defined
+    } else {
+      unique_len = std::uniform_int_distribution<>(10, 500)(rng);
+    }
+    int prompt_length = shared_len + unique_len;
+    trace.push_back({ t, prompt_length, tier_dist(rng), template_id, shared_len });
   }
   return trace;
 }
 
-// stats
+//stats
 double percentile(std::vector<double> values, double p) {
   if (values.empty()) return 0.0;
   std::sort(values.begin(), values.end());
@@ -602,7 +852,7 @@ LatencySummary summarize(const std::vector<double>& values) {
 
 bool file_is_empty(const std::string& path) {
   struct stat st;
-  if (stat(path.c_str(), &st) != 0) return true; // doesn't exist -> "empty"
+  if (stat(path.c_str(), &st) != 0) return true; 
   return st.st_size == 0;
 }
 
@@ -623,7 +873,10 @@ struct CliOptions {
   int kv_block_size=16;
   int total_kv_blocks=256;
   double ttft_slo_ms = 500.0;
-
+  int num_templates = 5;
+  bool prefix_cache = false;
+  std::string eviction = "lru";
+  bool quadratic_cost = false;
 };
 
 void print_usage() {
@@ -674,6 +927,10 @@ CliOptions parse_args(int argc, char** argv) {
     else if (key == "kv_block_size") opt.kv_block_size = std::stoi(val);
     else if (key == "total_kv_blocks") opt.total_kv_blocks = std::stoi(val);
     else if (key == "ttft_slo") opt.ttft_slo_ms = std::stod(val);
+    else if (key == "num_templates") opt.num_templates = std::stoi(val);
+    else if (key == "prefix_cache") opt.prefix_cache = (val == "1" || val == "true");
+    else if (key == "eviction") opt.eviction = val;
+    else if (key == "quadratic_cost") opt.quadratic_cost = (val == "1" || val == "true");
     else std::cerr << "warning: unknown flag --" << key << "\n";
   }
   return opt;
@@ -698,6 +955,16 @@ int main(int argc, char** argv) {
   config.kv_block_size = opt.kv_block_size;
   config.total_kv_blocks = opt.total_kv_blocks;
   config.ttft_slo_ms = opt.ttft_slo_ms;
+  config.num_templates = opt.num_templates;
+  config.prefix_cache = opt.prefix_cache;
+  config.eviction = opt.eviction;
+  config.quadratic_cost = opt.quadratic_cost;
+
+  if (!config.continuous && config.prefix_cache) {
+    std::cerr << "warning: --mode=static ignores --prefix_cache/--kv_block_size/"
+                 "--total_kv_blocks/--eviction (static mode has no KV manager); "
+                 "these flags will have no effect.\n";
+  }
 
     std::unique_ptr<AdmissionPolicy> policy;
   if (opt.policy == "shortprompt") {
@@ -717,7 +984,22 @@ int main(int argc, char** argv) {
                              std::ref(queue), std::ref(config), std::ref(*policy),
                              std::ref(stats));
 
-  auto trace = generate_trace(opt.seed, opt.n, opt.lambda);
+  auto trace = generate_trace(opt.seed, opt.n, opt.lambda, opt.num_templates);
+
+  if (config.continuous) {
+    for (const auto& te : trace) {
+      int req_blocks = (te.prompt_length + config.kv_block_size - 1) / config.kv_block_size;
+      if (req_blocks > config.total_kv_blocks) {
+        std::cerr << "error: a generated request needs " << req_blocks
+                  << " KV blocks (prompt_length=" << te.prompt_length
+                  << ") but total_kv_blocks=" << config.total_kv_blocks
+                  << ". It could never be admitted and the run would hang forever. "
+                  << "Increase --total_kv_blocks or --kv_block_size.\n";
+        return 1;
+      }
+    }
+  }
+
   std::vector<std::future<Result>> futures;
   futures.reserve(opt.n);
 
@@ -729,6 +1011,8 @@ int main(int argc, char** argv) {
     req.max_tokens = config.max_tokens;
     req.arrival_ms = trace[i].arrival_ms;
     req.ttft_deadline_ms = req.arrival_ms + get_tier_slo(req.tier);
+    req.template_id = trace[i].template_id;
+    req.shared_len = trace[i].shared_len;
 
     if (opt.pace) {
       double now = now_ms();
