@@ -35,17 +35,21 @@ plt.rcParams.update({
 CONFIG_COLORS = {
     "continuous_fcfs":        "#4fc3f7",
     "continuous_shortprompt": "#81c995",
+    "continuous_slo":         "#ba68c8",
     "static_fcfs":            "#ff7043",
     "static_shortprompt":     "#ffd54f",
 }
 
 def load_data(datadir):
     frames = []
-    for path in glob.glob(os.path.join(datadir, "*.csv")):
-        df = pd.read_csv(path)
-        frames.append(df)
+    for path in glob.glob(os.path.join(datadir, "*_lam*.csv")):
+        try:
+            df = pd.read_csv(path)
+            frames.append(df)
+        except Exception:
+            pass
     if not frames:
-        raise FileNotFoundError(f"No CSVs found in '{datadir}/'. Run sweep.ps1 first.")
+        raise FileNotFoundError(f"No sweep CSVs found in '{datadir}/'. Run sweep.ps1 first.")
     return pd.concat(frames, ignore_index=True)
 
 def compute_metrics(df):
@@ -55,17 +59,15 @@ def compute_metrics(df):
     df["wait_ms"]   = df["start_ms"]        - df["arrival_ms"]
     df["config"]    = df["mode"] + "_" + df["policy"]
 
-    # per (config, lambda): p50/p99 TTFT, throughput
-    agg = (
-        df.groupby(["config", "lambda"])
-        .apply(lambda g: pd.Series({
+    def calc_agg(g):
+        return pd.Series({
             "ttft_p50":     g["ttft_ms"].quantile(0.50),
             "ttft_p99":     g["ttft_ms"].quantile(0.99),
             "e2e_p99":      g["e2e_ms"].quantile(0.99),
-            "throughput":   len(g) / (g["end_ms"].max() - g["arrival_ms"].min()) * 1000,
-        }))
-        .reset_index()
-    )
+            "throughput":   len(g) / (g["end_ms"].max() - g["arrival_ms"].min()) * 1000 if (g["end_ms"].max() > g["arrival_ms"].min()) else 0.0,
+        })
+
+    agg = df.groupby(["config", "lambda"], as_index=False).apply(calc_agg, include_groups=False)
     return df, agg
 
 def plot_ttft_vs_lambda(agg, outpath):

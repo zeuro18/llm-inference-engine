@@ -84,9 +84,47 @@ Because memory is tight, cached prefixes eventually have to get evicted to make 
 
 ## Benchmarks
 
-Ran with `N=500` requests under a deliberately tight memory budget (100 total KV blocks, so eviction actually has to do work). Numbers are reproducible
+All benchmark simulations can be executed via `python scripts/run_benchmarks.py` or `scripts/sweep.ps1`.
 
-**1. Does prefix caching actually help?**
+### 1. Batching & Latency Dynamics (Continuous vs. Static)
+
+We swept arrival rates $\lambda \in [1, 20]$ req/s across $N=200$ requests under both continuous and static batching modes with different admission policies.
+
+| Policy / Mode (at $\lambda=5$) | TTFT (p50) | TTFT (p99) | Served Throughput | SLO Attainment |
+| :--- | :--- | :--- | :--- | :--- |
+| **Continuous (FCFS)** | **530 ms** | 63.9s | **2.72 req/s** | **50.0%** |
+| **Continuous (ShortPrompt)** | 1,425 ms | 63.4s | **2.72 req/s** | 40.5% |
+| **Continuous (SLO-Aware)** | 13,379 ms | **28.8s** | **2.72 req/s** | 8.5% |
+| **Static (FCFS)** | 25,369 ms | 121.2s | 1.53 req/s | 12.5% |
+| **Static (ShortPrompt)** | 30,469 ms | 113.4s | 1.51 req/s | 14.5% |
+
+- **Time To First Token (TTFT p99)**: Continuous batching significantly lowers prefill wait times by admitting new requests at every generation step instead of waiting for entire static batches to finish.
+
+![TTFT p99 vs Arrival Rate](data/ttft_p99.png)
+
+- **Throughput Saturation**: Static batching quickly saturates around ~1.5 req/s due to idle seat bubbles during decode tail execution. Continuous batching sustains higher throughput (~2.7+ req/s) by keeping slots consistently occupied.
+
+![Throughput vs Arrival Rate](data/throughput.png)
+
+- **End-to-End Latency CDF ($\lambda=5$ req/s)**: Continuous batching curves shift heavily to the left, showing that requests finish much faster without head-of-line blocking.
+
+![CDF of E2E Latency](data/e2e_cdf.png)
+
+### 2. Tiered SLO Attainment
+
+Under moderate to high traffic load, admission policies change which requests meet their latency deadlines:
+
+- **FCFS**: Simple queue order; maintains balanced overall completion under medium load.
+- **ShortPrompt**: Favors short prompts, improving median latency for lightweight requests at the expense of longer prompts.
+- **SLO-Aware (Earliest Deadline First)**: Prioritizes requests close to blowing their tier deadlines, tightly bounding tail latency (p99 TTFT).
+
+![SLO Attainment vs Arrival Rate](data/slo_attainment.png)
+
+### 3. Prefix Caching & Eviction Policies
+
+Ran with $N=500$ requests under a tight memory budget (100 total KV blocks) with shared prompt templates.
+
+**Does prefix caching help?**
 
 | Metric | No cache | Prefix caching (LRU) | Change |
 | :--- | :--- | :--- | :--- |
@@ -97,7 +135,7 @@ Ran with `N=500` requests under a deliberately tight memory budget (100 total KV
 
 ![Impact of Prefix Caching](data/caching_impact.png)
 
-**2. Which eviction policy wins under pressure?**
+**Eviction policy comparison under memory pressure:**
 
 | Metric | LRU | Cost-Ratio | GDS |
 | :--- | :--- | :--- | :--- |
@@ -107,11 +145,13 @@ Ran with `N=500` requests under a deliberately tight memory budget (100 total KV
 
 ![Eviction Policy Performance](data/eviction_policies.png)
 
-Cost-Ratio ends up hoarding expensive prefixes for too long and loses on both hit rate and speed as a result. GDS balances cost against size and recency and comes out ahead. Same idea as the real GreedyDual-Size algorithm, just applied to KV blocks instead of HTTP objects.
+Cost-Ratio can hoard expensive prefixes for too long and lose on both hit rate and speed. GDS balances compute cost against size and recency to achieve the highest hit rate.
+
+---
 
 ## Building and running
 
-Only a standard C++17 compiler, no dependencies.
+Only a standard C++17 compiler, no external dependencies.
 
 ```bash
 g++ -O3 -std=c++17 main.cpp -o main
@@ -128,11 +168,18 @@ g++ -O3 -std=c++17 main.cpp -o main
 ./main --policy=slo --n=500 --num_templates=5 --prefix_cache=true --eviction=gds --total_kv_blocks=100
 ```
 
-By default the simulator paces itself in real time to mimic actual request arrivals, so a run that reports 188s of simulated duration will also take roughly 188 real seconds to finish. Pass `--pace=0` to skip the sleeping and run the sim as fast as your CPU allows for busy, memory-constrained workloads (like the benchmark above) this gives identical numbers, but for light/low-traffic workloads it can produce unrealistic (even negative) wait times, since it removes the real-time sync between when requests "arrive" and when the scheduler is actually free to look at them. Use it for quick iteration, not for final numbers on lightly-loaded configs.
+**Run full simulation suite & plot graphs:**
+```bash
+python scripts/run_benchmarks.py
+```
+
+By default the simulator paces itself in real time to mimic actual request arrivals (`--pace=1`). Pass `--pace=0` for discrete-event fast execution to run multi-sweep benchmarks in seconds.
+
+---
 
 ## CLI flags
 
-`--help` only documents a handful of the flags, so here's the full list of what `parse_args` actually accepts:
+Full list of flags accepted by `parse_args`:
 
 | Flag | Default | What it does |
 | :--- | :--- | :--- |
@@ -149,11 +196,11 @@ By default the simulator paces itself in real time to mimic actual request arriv
 | `--prefix_cache` | `false` | turn prefix caching on/off |
 | `--eviction` | `lru` | `lru`, `cost_ratio`, or `gds` |
 | `--quadratic_cost` | `false` | adds a quadratic term to prefill cost, to simulate attention scaling with sequence length |
-| `--pace` | `1` | sleep in real time to match simulated arrivals (see note above) |
+| `--pace` | `1` | `1` to sleep in real time to match arrivals, `0` for discrete event fast execution |
 | `--out` | `results.csv` | per-request CSV output; `none` to skip |
-| `--summary` | `summary.csv` | one summary row gets *appended* per run, so you can point many runs (different seeds/policies) at the same file for sweeps |
+| `--summary` | `summary.csv` | one summary row gets *appended* per run, so you can point many runs at the same file for sweeps |
 | `--verbose` | `false` | also print a line per request to stdout |
-| `--ttft_slo` | `500.0` | parsed but currently unused — per-tier SLOs are hardcoded in `get_tier_slo()` instead |
+| `--ttft_slo` | `500.0` | parsed but currently unused — per-tier SLOs are defined in `get_tier_slo()` |
 
 
 

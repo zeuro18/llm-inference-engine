@@ -338,31 +338,59 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
   int total_batches = 0;
   double sim_clock = 0.0;
 
-  while (!(done && waiting.empty())) {
-    if (waiting.empty()) {
-      Request first = q.pop(); //nap until someone arrives
-      if (first.id == -1) done = true;
-      else waiting.push_back(std::move(first));
+  while (true) {
+    while (!done) {
+      if (waiting.empty()) {
+        Request first = q.pop();
+        if (first.id == -1) { done = true; break; }
+        waiting.push_back(std::move(first));
+      } else {
+        auto m = q.try_pop_for(std::chrono::milliseconds(0));
+        if (!m) break;
+        if (m->id == -1) { done = true; break; }
+        waiting.push_back(std::move(*m));
+      }
     }
 
-    while (!done && (int)waiting.size() < config.max_slots) {
-      auto m = q.try_pop_for(std::chrono::milliseconds((long)config.batch_timeout_ms));
-      if (!m) break;
-      if (m->id == -1) { done = true; break; }
-      waiting.push_back(std::move(*m));
+    if (waiting.empty() && done) break;
+
+    double min_arr = 1e18;
+    for (const auto& r : waiting) min_arr = std::min(min_arr, r.arrival_ms);
+    if (sim_clock < min_arr) sim_clock = min_arr;
+
+    std::vector<Request> arrived;
+    std::vector<Request> future_reqs;
+    for (auto& r : waiting) {
+      if (r.arrival_ms <= sim_clock + (config.pace_with_sleeps ? config.batch_timeout_ms : 0.0)) {
+        arrived.push_back(std::move(r));
+      } else {
+        future_reqs.push_back(std::move(r));
+      }
+    }
+    waiting = std::move(future_reqs);
+
+    if (arrived.empty()) {
+      if (!waiting.empty()) {
+        sim_clock = min_arr;
+        continue;
+      }
+      if (done) break;
+      continue;
     }
 
-    std::vector<int> first_chunk_costs = compute_first_chunk_costs(waiting, config.prefill_chunk_size, nullptr);
-    std::vector<int> picks = policy.pick(waiting, first_chunk_costs, config.max_slots, config.max_batch_tokens, sim_clock);
-    std::sort(picks.begin(), picks.end(), [](int a, int b) { return a > b; }); // back->front
+    std::vector<int> first_chunk_costs = compute_first_chunk_costs(arrived, config.prefill_chunk_size, nullptr);
+    std::vector<int> picks = policy.pick(arrived, first_chunk_costs, config.max_slots, config.max_batch_tokens, sim_clock);
+    std::sort(picks.begin(), picks.end(), [](int a, int b) { return a > b; });
 
     std::vector<Slot> batch;
     for (int idx : picks) {
       Slot s;
-      s.request = std::move(waiting[idx]);
+      s.request = std::move(arrived[idx]);
       batch.push_back(std::move(s));
-      waiting.erase(waiting.begin() + idx); 
+      arrived.erase(arrived.begin() + idx); 
     }
+    for (auto& r : arrived) waiting.push_back(std::move(r));
+
     if (batch.empty()) continue;
 
     int seats = (int)batch.size();
@@ -398,7 +426,7 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
           s.request.promise.set_value(Result{ 
               s.request.id, s.request.tier, s.request.prompt_length, 
               s.true_out_len, s.request.arrival_ms, 
-              s.start_ms, s.first_token_ms, s.end_ms});
+              s.start_ms, s.first_token_ms, s.end_ms, s.request.shared_len});
         }
       }
     }
@@ -408,7 +436,7 @@ void worker_static(ThreadSafeQueue<Request>& q, const EngineConfig& config,
     total_idle += idle;
     total_seat_ticks += (long)seats * ticks;
     ++total_batches;
-    sim_clock = t; //carry the simulated clock forward into the next batch
+    sim_clock = t;
 
     if (config.pace_with_sleeps)
       std::this_thread::sleep_for(
@@ -491,17 +519,17 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
   }
 
   while (!(done && waiting.empty() && active.empty())) {
-    if (active.empty() && waiting.empty() && !done) {
-      Request first = q.pop();
-      if (first.id == -1) done = true;
-      else waiting.push_back(std::move(first));
-    }
-
-    while (true) {
-      auto m = q.try_pop_for(std::chrono::milliseconds(0));
-      if (!m) break;
-      if (m->id == -1) { done = true; break; }
-      waiting.push_back(std::move(*m));
+    while (!done) {
+      if (active.empty() && waiting.empty()) {
+        Request first = q.pop();
+        if (first.id == -1) { done = true; break; }
+        waiting.push_back(std::move(first));
+      } else {
+        auto m = q.try_pop_for(std::chrono::milliseconds(0));
+        if (!m) break;
+        if (m->id == -1) { done = true; break; }
+        waiting.push_back(std::move(*m));
+      }
     }
 
     for (int i = (int)active.size() - 1; i >= 0; --i) {
@@ -525,52 +553,60 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
         active.erase(active.begin() + i);
       }
     }
-     
+
+    if (done && waiting.empty() && active.empty()) break;
+
+    if (active.empty() && !waiting.empty()) {
+      double min_arr = 1e18;
+      for (const auto& r : waiting) min_arr = std::min(min_arr, r.arrival_ms);
+      if (t < min_arr) t = min_arr;
+    }
+
+    std::vector<Request> arrived;
+    std::vector<Request> future_reqs;
+    for (auto& r : waiting) {
+      if (r.arrival_ms <= t) {
+        arrived.push_back(std::move(r));
+      } else {
+        future_reqs.push_back(std::move(r));
+      }
+    }
+    waiting = std::move(future_reqs);
+
     int budget_used = 0;
     for (const auto& s : active) {
       budget_used += slot_cost(s, cfg.prefill_chunk_size);
     }
     int budget_remaining = cfg.max_batch_tokens - budget_used;
     int free_slots = cfg.max_slots - (int)active.size();
-    bool was_idle = active.empty();
-    
+
     // admit new requests
-    if (free_slots > 0 && budget_remaining > 0 && !waiting.empty()) {
+    if (free_slots > 0 && budget_remaining > 0 && !arrived.empty()) {
       std::vector<int> first_chunk_costs = compute_first_chunk_costs(
-          waiting, cfg.prefill_chunk_size, cfg.prefix_cache ? &prefix_cache : nullptr);
-      std::vector<int> picks = policy.pick(waiting, first_chunk_costs, free_slots, budget_remaining, t);
-      if (was_idle && !picks.empty()) {
-        double max_arrival = 0.0;
-        for (int idx : picks) {
-          max_arrival = std::max(max_arrival, waiting[idx].arrival_ms);
-        }
-        t = std::max(t, max_arrival);
-      }
+          arrived, cfg.prefill_chunk_size, cfg.prefix_cache ? &prefix_cache : nullptr);
+      std::vector<int> picks = policy.pick(arrived, first_chunk_costs, free_slots, budget_remaining, t);
       
       std::vector<int> admitted_picks;
       std::unordered_map<int, int> reserved_blocks;
-      // idx-> cache entry this pick is relying on. Recorded rather than rederived after
-      // admission, so we increment ref_count exactly once per admitted
-      // hit and can protect the entry from eviction by a later pick in same batch
       std::unordered_map<int, PrefixCacheEntry*> pending_hits;
+      int decode_headroom = (int)active.size();
+
       for (int idx: picks) {
-        int required_blocks = (waiting[idx].prompt_length+cfg.kv_block_size-1)/cfg.kv_block_size;
-        auto* cached = (cfg.prefix_cache && waiting[idx].template_id >= 0) ? prefix_cache.lookup(waiting[idx].template_id) : nullptr;
+        int required_blocks = (arrived[idx].prompt_length+cfg.kv_block_size-1)/cfg.kv_block_size;
+        auto* cached = (cfg.prefix_cache && arrived[idx].template_id >= 0) ? prefix_cache.lookup(arrived[idx].template_id) : nullptr;
         bool tentative_hit = false;
         if (cached && cached->blocks_used > 0) {
-            int unique_len = waiting[idx].prompt_length - waiting[idx].shared_len;
+            int unique_len = arrived[idx].prompt_length - arrived[idx].shared_len;
             required_blocks = (unique_len + cfg.kv_block_size - 1) / cfg.kv_block_size;
-            // Reserve this entry immediately so it cant be evicted by a
-            // later picks budget check within this same admission pass
             cached->ref_count++;
             tentative_hit = true;
         }
 
-        if (allocator.free_blocks() < required_blocks && cfg.prefix_cache) {
-            evict_for_blocks(required_blocks, allocator, prefix_cache, cfg, total_ticks, gds_L);
+        if (allocator.free_blocks() < required_blocks + decode_headroom && cfg.prefix_cache) {
+            evict_for_blocks(required_blocks + decode_headroom, allocator, prefix_cache, cfg, total_ticks, gds_L);
         }
 
-        if (allocator.free_blocks() >= required_blocks) {
+        if (allocator.free_blocks() >= required_blocks + decode_headroom || (active.empty() && allocator.free_blocks() >= required_blocks)) {
           admitted_picks.push_back(idx);
           allocator.allocate(required_blocks);
           reserved_blocks[idx] = required_blocks;
@@ -583,7 +619,7 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
       std::sort(admitted_picks.begin(), admitted_picks.end(), [](int a, int b) { return a > b; });
       for (int idx: admitted_picks) {
         Slot s;
-        s.request = std::move(waiting[idx]);
+        s.request = std::move(arrived[idx]);
         s.true_out_len = sample_out_length(rng);
         s.start_ms = t;
         s.prompt_tokens_processed = 0;
@@ -597,7 +633,6 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
         if (hit_it != pending_hits.end()) {
             PrefixCacheEntry* cached = hit_it->second;
             prefix_cache.hits++;
-            // ref_count was already bumped when we reserved this pick above.
             cached->last_used_tick = total_ticks;
             s.prompt_tokens_processed = cached->shared_len;
             s.cached_prefix_blocks = cached->blocks_used;
@@ -608,21 +643,23 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
             }
         }
 
-        if(run_start<0) run_start=t;
+        if (run_start < 0) run_start = t;
         active.push_back(std::move(s));
-        waiting.erase(waiting.begin()+idx);
+        arrived.erase(arrived.begin() + idx);
       }
+    }
+
+    for (auto& r : arrived) {
+      waiting.push_back(std::move(r));
     }
 
     if (active.empty()) continue;
 
-    // calculate tokens processed in this tick
     int tokens_tick = 0;
     for (const auto& s : active) {
       tokens_tick += slot_cost(s, cfg.prefill_chunk_size);
     }
 
-    // step time= total tokens processed
     double step_ms = cfg.d0 + cfg.d1 * tokens_tick;
     t += step_ms;
     total_ticks++;
@@ -638,12 +675,10 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
         if (s.prompt_tokens_processed >= s.request.prompt_length) {
           s.prefill_done = true;
           s.first_token_ms = t;
-          s.tokens_generated = 1; //first free token
+          s.tokens_generated = 1;
           
           if (cfg.prefix_cache && s.needs_cache_insert && s.request.template_id >= 0) {
               int shared_blocks = (s.request.shared_len + cfg.kv_block_size - 1) / cfg.kv_block_size;
-              // another slot on the same template may have finished itsprefill and inserted a
-              // cache entry while we were still prefilling-> so join instead of overwriting.
               auto* existing = prefix_cache.lookup(s.request.template_id);
               if (existing) {
                   existing->ref_count++;
@@ -665,13 +700,12 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
                   prefix_cache.entries[entry.template_id] = entry;
 
                   s.cached_prefix_blocks = shared_blocks;
-                  s.kv_blocks_used -= shared_blocks; // slot transfers ownership to cache
+                  s.kv_blocks_used -= shared_blocks;
               }
               s.needs_cache_insert = false;
           }
         }
       } else {
-
         // DECODE
         s.tokens_generated++;
         tokens_made++;
@@ -690,8 +724,6 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
           s.kv_blocks_used += got;
           int still_need = extra_blocks - got;
           if (still_need > 0) {
-            //KV Preemption= repeatedly preempt the lowest priority eligible active slot
-            // until we have freed enough blocks or run out of eligible victims
             while (still_need > 0) {
               auto victim_it = active.end();
               for (auto it = active.begin(); it != active.end(); ++it) {
@@ -700,7 +732,7 @@ void worker_continuous(ThreadSafeQueue<Request>& q, const EngineConfig& cfg,
                   victim_it = it;
                 }
               }
-              if (victim_it == active.end()) break; // no eligible victim left
+              if (victim_it == active.end()) break;
 
               victim_it->preempted = true;
               stats.total_preemptions++;
@@ -1041,11 +1073,12 @@ int main(int argc, char** argv) {
     }
     out << std::fixed << std::setprecision(3);
     out << "mode,policy,lambda,seed,id,tier,prompt_length,true_out_len,"
-           "arrival_ms,start_ms,first_token_ms,end_ms\n";
+           "arrival_ms,start_ms,first_token_ms,end_ms,shared_len\n";
     for (auto& r : results) {
       out << opt.mode << ',' << opt.policy << ',' << opt.lambda << ',' << opt.seed << ','
           << r.id << ',' << r.tier << ',' << r.prompt_length << ',' << r.true_out_len << ','
-          << r.arrival_ms << ',' << r.start_ms << ',' << r.first_token_ms << ',' << r.end_ms
+          << r.arrival_ms << ',' << r.start_ms << ',' << r.first_token_ms << ',' << r.end_ms << ','
+          << r.shared_len
           << '\n';
       if (opt.verbose) {
         std::cout << std::fixed << std::setprecision(3);
